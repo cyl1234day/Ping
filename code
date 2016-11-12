@@ -1,0 +1,306 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <Winsock.h>
+#include <string.h>
+#pragma comment(lib,"ws2_32.lib")
+//在该段代码中定义了IP和ICMP协议头的结构
+#pragma pack(4)      //指定结构成员使用紧凑对齐
+#define ICMP_ECHOREPLY 0
+#define ICMP_ECHOREQ 8
+//定义符合RFC 791 的IP协议头
+typedef struct tagIPHDR
+{
+	u_char VIHL;// 版本号和头长度（各占4位）
+	u_char TOS;// 服务类型
+	short TotLen;// 封包总长度，即整个IP报的长度
+	short ID; // 封包标识，惟一标识发送的每一个数据报
+	short FlagOff;    // 标志
+	u_char TTL; // 生存时间
+	u_short Checksum; // 校验和
+	struct in_addr iaSrc; // 源IP地址
+	struct in_addr iaDst; // 目标IP地址
+}IPHDR, *PIPHDR;
+/////////////////////////////////
+//定义符合RFC 792的ICMP协议头
+typedef struct tagICMPHDR
+{
+	u_char Type;// 类型
+	u_char Code; // 代码
+	u_short Checksum;// 校验和
+	u_short ID; // 标识符
+	u_short Seq; // 序列号
+	char Data;//返回的数据
+}ICMPHDR, *PICMPHDR;
+////////////////////////////////
+//请求回送的数据长度
+#define REQ_DATASIZE 32
+//ICMP回送请求的数据结构
+typedef struct tagECHOREQUEST
+{
+	ICMPHDR icmpHdr;
+	DWORD dwTime;
+	char cData[REQ_DATASIZE];
+}ECHOREQUEST, *PECHOREQUEST;
+//////////////////////////////
+//ICMP回送应答
+typedef struct tagECHOREPLY
+{
+	IPHDR ipHdr;
+	ECHOREQUEST echoRequest;
+	char cFiller[256];
+}ECHOREPLY, *PECHOREPLY;
+//#pragma pack()
+
+//函数声明
+void Ping();//调用ping函数对输入的地址ping处理
+void ReportError(LPCSTR pstrFrom);//处理错误
+int WaitForEchoReply(SOCKET s);//确定是否有数据等待读取
+u_short in_cksum(u_short *addr, int len);//计算校验和
+//ICMP回送请求和应答函数声明
+int SendEchoRequest(SOCKET, LPSOCKADDR_IN);//发送报文请求
+DWORD RecvEchoReply(SOCKET, LPSOCKADDR_IN, u_char*);//接受报文信息
+char DestIP[50];//把输入的地址声明为全局变量
+char InputIP[50];
+//主程序
+void main()
+{
+	WSADATA wsaData;//WSADATA结构被用来保存函数WSAStartup返回的Windows Sockets初始化信息
+	WORD wVersionRequested = MAKEWORD(1, 1);   /////套接字版本号
+	int nRet;
+	//命令行参数检查
+	while (1)
+	{
+		fprintf(stderr, "\nUsage:ping hostname/IP/URL \n");
+		//return;
+
+		//初始化Winsock
+		nRet = WSAStartup(wVersionRequested, &wsaData);//WSAStartup函数用于初始化//Winsock，int WSAStarup(WORD wVersionRequested,LPWSADATA lpWSAData);
+		//当函数成功调用时返回0，失败时返回非0的值
+		if (nRet)
+		{
+			fprintf(stderr, "\nError initializing Winsock\n");
+			return;
+		}
+		//Winsock版本检查
+		if (wsaData.wVersion != wVersionRequested)
+		{
+			fprintf(stderr, "\nWinsock version not supported\n");
+			return;
+		}
+		//调用PING函数
+		memset(InputIP, 0, sizeof(InputIP)); //将输入的数组里面的数据清空
+		memset(DestIP, 0, sizeof(DestIP));
+		gets(InputIP);
+		for (int i = 0; i<50; i++)
+		{
+			InputIP[i] = InputIP[i + 5];
+		}
+		Ping();
+		//释放Winsock
+		WSACleanup();
+
+	}
+}
+//Ping()函数
+//调用SendEchoRequest()和RecvEchoReply()函数
+//并输出结果
+void Ping()
+{
+	SOCKET rawSocket;//建立一个原始套接口
+	LPHOSTENT IpHost;
+	struct sockaddr_in saDest;//定义端口号目的地址，Socket编程相关数据类型定义struct //sockaddr_in
+	struct sockaddr_in saSrc;//定义端口的源地址
+	DWORD dwTimeSent;//DWORD 表示 32bit 无符号整数，即双字无符号整数
+	DWORD dwElapsed;
+	u_char cTTL;
+	int nLoop;
+	int nRet;
+	int sensum = 0;
+	int recvsum = 0;
+	int n;
+	DWORD max = 0, min = 888888, sum = 0;
+	static ECHOREPLY echoReply;
+	static ECHOREQUEST echoReq;
+	//创建一个原始套接口
+	rawSocket = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);//socket函数SOCKET socket //（int af,int type,int protocol）
+	//当函数成功调用时返回一个新的SOCKET(Socket Descriptor)
+	//af - 地址家族(通常使用:AF_INET)，type - socket的种类，                                                    //protocol - 所使用的协议
+	if (rawSocket == SOCKET_ERROR)
+	{
+		ReportError("socket()");
+		return;
+	}
+	//根据主机名查询主机地址
+	for (int k = 0; k<sizeof(InputIP); k++)//输入处理
+	{
+
+		if (InputIP[k] == '-'&&InputIP[k + 1] == 't')//如果输入有-t进入无限循环
+		{
+			for (int i = 0; i<k - 1; i++)
+				DestIP[i] = InputIP[i];
+			n = -1;
+			break;
+		}
+		else { DestIP[k - 1] = InputIP[k - 1]; n = 4; }
+	}
+	IpHost = gethostbyname(DestIP);//将输入的内容地址/域名/主机名传送给ipHost
+	if (IpHost == NULL)
+	{
+		fprintf(stderr, "\nTimeout:%s\n", DestIP);
+		return;
+	}
+	//设置目标套接口地址
+	saDest.sin_addr.s_addr = *((u_long FAR*)(IpHost->h_addr));
+	saDest.sin_family = AF_INET;
+	saDest.sin_port = 0;
+	//输出Ping程序的提示信息，例如进行本机Ping
+	printf("\nPinging %s[%s]with %d bytes of data:\n",
+		DestIP,
+		inet_ntoa(saDest.sin_addr),
+		REQ_DATASIZE);                /*回送数据长度*/
+	//控制ping执行的次数p
+	for (nLoop = 0; nLoop != n; nLoop++)
+	{
+		//发送ICMP回送请求
+		SendEchoRequest(rawSocket, &saDest);
+		nRet = sendto(rawSocket, (LPSTR)&echoReq, sizeof(ECHOREQUEST), 0, (struct sockaddr *)&saDest, sizeof(saDest));
+		if (nRet == SOCKET_ERROR)
+			ReportError("sento()");
+		else
+			sensum = sensum + 1;
+		//使用select()等待接收回送的数据
+		nRet = WaitForEchoReply(rawSocket);
+		if (nRet == SOCKET_ERROR)
+		{
+			ReportError("select()");
+			break;
+		}
+		if (!nRet)
+		{
+			printf("\nTimeOut");//输出超时提示
+			break;
+		}
+		//接收应答
+		dwTimeSent = RecvEchoReply(rawSocket, &saSrc, &cTTL);
+		//计算传输时间，并输出提示信息。
+		dwElapsed = GetTickCount() - dwTimeSent;
+		if (max<dwElapsed)
+			max = dwElapsed;
+		if (min>dwElapsed)
+			min = dwElapsed;
+		sum += dwElapsed;
+		printf("\nReply from:%s；bytes=%d time=%ldms TTL=%d",
+			inet_ntoa(saSrc.sin_addr),
+			REQ_DATASIZE,
+			dwElapsed,
+			cTTL);
+		recvsum++;
+		Sleep(800);
+
+	}
+	int avg = (sensum - recvsum) / sensum * 100;
+	DWORD Average = sum / n;
+	printf("\n");
+	printf("\n");
+	printf("ping statistics for %s:", inet_ntoa(saSrc.sin_addr));
+	printf("\n    Packets:Sent = %d, Recvived = %d, Lost = %d ,<%d%% loss>", sensum, recvsum, sensum - recvsum, avg);
+	printf("\nApproximate round trip times in milli_seconds:");
+	printf("\n    minimum = %ldms, maximum = %ldms, Average = %ldms", min, max, Average);
+	printf("\n");
+	nRet = closesocket(rawSocket);
+	if (nRet == SOCKET_ERROR)
+		ReportError("closesocket()");
+}
+//////////////////////////////////////////////////////
+//SendEchoRequst()
+//给目标站点发送回送请求
+int SendEchoRequest(SOCKET s, LPSOCKADDR_IN lpstToAddr)
+{
+	static ECHOREQUEST echoReq;
+	static nId = 1;
+	static nSeq = 1;
+	int nRet;
+	//填写回送请求信息
+	echoReq.icmpHdr.Type = ICMP_ECHOREQ;
+	echoReq.icmpHdr.Code = 0;
+	echoReq.icmpHdr.Checksum = 0;
+	echoReq.icmpHdr.ID = nId++;
+	echoReq.icmpHdr.Seq = nSeq++;
+	//填写要发送的数据
+	for (nRet = 0; nRet<REQ_DATASIZE; nRet++)
+		echoReq.cData[nRet] = ' ' + nRet;
+	//保存发送时间
+	echoReq.dwTime = GetTickCount();
+	//数据存入包中并计算校验和
+	echoReq.icmpHdr.Checksum = in_cksum((u_short*)&echoReq, sizeof(ECHOREQUEST));
+	//发送回送请求
+	nRet = sendto(s, (LPSTR)&echoReq, sizeof(ECHOREQUEST), 0, (LPSOCKADDR)lpstToAddr, sizeof(SOCKADDR_IN));//sendto函数利用Socket进行发送数据，成功时返回已经发送的字//节数.
+	//sendto函数int sendto ( SOCKET s , const char FAR *buf , int len , int flags , const //struct sockaddr FAR *to , int token );
+	if (nRet == SOCKET_ERROR)
+		ReportError("sento()");
+	return (nRet);
+}
+//////////////////////////////////////////////////////////
+//RecvechoReply()
+//接收数据并对字段进行分析
+DWORD RecvEchoReply(SOCKET s, LPSOCKADDR_IN lpsaFrom, u_char *pTTL)
+{
+	ECHOREPLY echoReply;
+	int nRet;
+	int nAddrLen = sizeof(struct sockaddr_in);
+	//接收回送应答
+	nRet = recvfrom(s, (LPSTR)&echoReply, sizeof(ECHOREPLY), 0, (LPSOCKADDR)lpsaFrom, &nAddrLen);//recvfrom函数利用Socket进行接受数据，成功时返回收到的字节数，如果连
+	//接被中断则返回0
+	//int recvfrom( SOCKET s , char FAR *buf , int len , int flags )
+	//检查返回的值
+	if (nRet == SOCKET_ERROR)
+		ReportError("recvfrom()");
+	//返回发送时间的IP生存时间TTL
+	*pTTL = echoReply.ipHdr.TTL;
+	return (echoReply.echoRequest.dwTime);
+}
+//////////////////////////////////////////////////////////
+//ReportError()
+//输出发生的错误
+void ReportError(LPCSTR pWhere)
+{
+	fprintf(stderr, "\n%s error:%d\n", WSAGetLastError());
+}
+////////////////////////////////////////////////////////
+//WaitForEchoReply()
+//使用select()函数进行状态查询，以确定是否有数据等待读取
+int WaitForEchoReply(SOCKET s)
+{
+	struct timeval Timeout;
+	fd_set readfds;
+	readfds.fd_count = 1;
+	readfds.fd_array[0] = s;
+	Timeout.tv_sec = 5;
+	Timeout.tv_usec = 0;
+	return (select(1, &readfds, NULL, NULL, &Timeout));//select函数int select ( int nfds , fd_set FAR *readfds , fd_set FAR *writefds , fd_set FAR *exceptfds , const struct timeval FAR *timeout );
+	//成功时返回已经发送的字节数，失败时返回SOCKET_ERROR
+}
+//in_cksum()
+//计算校验和
+u_short in_cksum(u_short *addr, int len)
+{
+	register int nleft = len;
+	register u_short *w = addr;
+	register u_short answer;
+	register int sum = 0;
+	while (nleft>1)
+	{
+		sum += *w++;
+		nleft -= 2;
+	}
+	if (nleft == 1)
+	{
+		u_short u = 0;
+		*(u_char *)(&u) = *(u_char *)w;
+		sum += u;
+	}
+	sum = (sum >> 16) + (sum & 0xffff);
+	sum += (sum >> 16);
+	answer = ~sum;
+	return(answer);
+}
